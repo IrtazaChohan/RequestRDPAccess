@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Automates login to BeyondTrust Password Safe, retrieves the managed account ID, requests an RDP session, and checks in the request.
+    Retrieves all managed accounts from BeyondTrust Password Safe using pagination and allows filtering by domain name or username.
 
 .DESCRIPTION
-    This script signs into BeyondTrust Password Safe, retrieves the managed account ID for a specified domain account using pagination, requests an RDP session for a specified server, creates the session, and checks in the request.
-    Errors during sign-in are normal and can be ignored. The password prompt can be skipped by clicking "Cancel".
+    This script automates the retrieval of managed accounts from BeyondTrust Password Safe, bypassing the 1,000 record limit using pagination. 
+    It supports filtering by domain name (or server name) and username.
 
 .VERSION HISTORY
-    1.0 - 04-12-2024 - Initial version by Irtaza Chohan
+    1.1 - 04-12-2024 - Streamlined version focusing on managed account retrieval by Irtaza Chohan
 
 .NOTES
     Author: Irtaza Chohan
@@ -31,119 +31,59 @@ $headers = if ($Credential.Password.Length -gt 0) {
     @{ Authorization = "PS-Auth key=${apiKey};runas=${runAsUser}" }
 }
 
-# Sign In Block
-try {
-    Write-Host "Signing-in.."
-    $signinResult = Invoke-RestMethod -Uri "${baseUrl}Auth/SignAppIn" -Method Post -Headers $headers -SessionVariable session
-    Write-Host "..Signed-In as $($signinResult.UserName)"
-} catch {
-    Write-Host "Sign-in failed: $($_.Exception.Message)"
-    if ($_.Exception.Response.StatusCode.value__ -eq 401 -and ($_.Exception.Response.Headers.Contains("WWW-Authenticate-2FA") -eq $true)) {
-        $mfacode = Read-Host "Enter your MFA Challenge Code:"
-        $headers.Authorization += ";challenge=${mfacode}"
-        if ($Credential.Password.Length -gt 0) { $headers.Authorization += ";pwd=[${Credential.GetNetworkCredential().Password}]" }
-        try {
-            $mfaSignin = Invoke-RestMethod -Uri "${baseUrl}Auth/SignAppIn" -Method Post -ContentType "application/json" -Headers $headers -WebSession $session
-            Write-Host "..Signed-In to BeyondTrust as $($mfaSignin.UserName)"
-        } catch { Write-Host "MFA Sign-in failed: $($_.Exception.Message)"; throw }
-    } else { throw }
-}
+# Define search parameters
+$domainName = Read-Host "Enter the domain or server name to search for"
+$accountName = Read-Host "Enter the username to search for (leave blank to ignore)"
 
-# Define the domain and account details
-$domainName = "lseg.stockex.local"
-$accountName = "ichohan-a"
-$serverName = "vx-2841533925"
-$accessType = "RDP"
-
-# Function to retrieve managed account ID with pagination
-function Get-ManagedAccountId {
+# Function to retrieve all managed accounts with filtering
+function Get-ManagedAccounts {
     param (
-        [string]$domainName,
-        [string]$accountName,
         [string]$baseUrl,
         [hashtable]$headers,
+        [string]$domainName,
+        [string]$accountName,
         [int]$limit = 1000
     )
 
     $offset = 0
-    $managedAccountId = $null
+    $allAccounts = @()
 
     while ($true) {
-        $uri = "${baseUrl}ManagedAccounts?accountname=${domainName}\${accountName}&limit=${limit}&offset=${offset}"
+        $uri = "${baseUrl}ManagedAccounts?limit=${limit}&offset=${offset}"
         Write-Host "Requesting: $uri"
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -WebSession $session
-        Write-Host "Received $($response.Count) results"
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
 
-        foreach ($account in $response) {
-            Write-Host "Checking account: $($account.accountName)"
-            if ($account.accountName -eq "${domainName}\${accountName}") {
-                $managedAccountId = $account.id
-                break
-            }
-        }
-
-        if ($managedAccountId -ne $null -or $response.Count -lt $limit) {
+        if ($response.Count -eq 0) {
             break
         }
 
+        $allAccounts += $response.accounts
         $offset += $limit
+
+        if ($response.Count -lt $limit) {
+            break
+        }
     }
 
-    return $managedAccountId
-}
-
-# Retrieve the Managed Account ID
-try {
-    $managedAccountId = Get-ManagedAccountId -domainName $domainName -accountName $accountName -baseUrl $baseUrl -headers $headers
-    if ($managedAccountId -eq $null) {
-        throw "Managed account ID not found."
+    # Filter accounts based on domain/server name and optional username
+    $filteredAccounts = $allAccounts | Where-Object {
+        ($_.domainName -eq $domainName -or $_.serverName -eq $domainName) -and
+        ($accountName -eq "" -or $_.username -eq $accountName)
     }
-    Write-Host "Managed Account ID: $managedAccountId"
-} catch {
-    Write-Host "Failed to retrieve managed account ID: $($_.Exception.Message)"
-    throw
+
+    return $filteredAccounts
 }
 
-# Request an RDP session
-$requestBody = @{
-    systemName = $serverName
-    accessType = $accessType
-    reason = "Automated RDP session request"
-}
+# Retrieve the managed accounts
 try {
-    $requestResponse = Invoke-RestMethod -Uri "${baseUrl}Requests" -Method Post -Body ($requestBody | ConvertTo-Json) -ContentType "application/json" -Headers $headers -WebSession $session
-    $requestId = $requestResponse.id
-    Write-Host "Request ID: $requestId"
+    $managedAccounts = Get-ManagedAccounts -baseUrl $baseUrl -headers $headers -domainName $domainName -accountName $accountName
+    if ($managedAccounts.Count -eq 0) {
+        Write-Host "No managed accounts found matching the criteria."
+    } else {
+        Write-Host "Managed accounts matching the criteria:"
+        $managedAccounts | Format-Table -Property id, username, domainName, serverName
+    }
 } catch {
-    Write-Host "Failed to request session: $($_.Exception.Message)"
-    throw
-}
-
-# Create the session
-try {
-    $sessionResponse = Invoke-RestMethod -Uri "${baseUrl}Requests/$requestId/Sessions" -Method Post -Body ($requestBody | ConvertTo-Json) -ContentType "application/json" -Headers $headers -WebSession $session
-    Write-Host "Session created successfully."
-    # Output the session details
-    $sessionResponse
-} catch {
-    Write-Host "Failed to create session: $($_.Exception.Message)"
-    throw
-}
-
-# Check in the request
-try {
-    Invoke-RestMethod -Uri "${baseUrl}Requests/$requestId/Checkin" -Method Put -Headers $headers -WebSession $session
-    Write-Host "Request checked in successfully."
-} catch {
-    Write-Host "Failed to check in request: $($_.Exception.Message)"
-    throw
-}
-
-# Sign out
-try {
-    Invoke-RestMethod -Uri "${baseUrl}Auth/Signout" -Method Post -Headers $headers -WebSession $session
-    Write-Host "Signed out successfully."
-} catch {
-    Write-Host "Failed to sign out: $($_.Exception.Message)"
+    Write-Host "Failed to retrieve managed accounts: $($_.Exception.Message)"
     throw
 }
