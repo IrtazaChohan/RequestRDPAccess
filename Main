@@ -22,15 +22,7 @@ try {
     Write-Host "..Signed-In as $($signinResult.UserName)"
 } catch {
     Write-Host "Sign-in failed: $($_.Exception.Message)"
-    if ($_.Exception.Response.StatusCode.value__ -eq 401 -and ($_.Exception.Response.Headers.Contains("WWW-Authenticate-2FA") -eq $true)) {
-        $mfacode = Read-Host "Enter your MFA Challenge Code:"
-        $headers.Authorization += ";challenge=${mfacode}"
-        if ($Credential.Password.Length -gt 0) { $headers.Authorization += ";pwd=[${Credential.GetNetworkCredential().Password}]" }
-        try {
-            $mfaSignin = Invoke-RestMethod -Uri "${baseUrl}Auth/SignAppIn" -Method Post -ContentType "application/json" -Headers $headers -WebSession $session
-            Write-Host "..Signed-In to BeyondTrust as $($mfaSignin.UserName)"
-        } catch { Write-Host "MFA Sign-in failed: $($_.Exception.Message)"; throw }
-    } else { throw }
+    throw
 }
 
 # Define search parameters
@@ -56,21 +48,21 @@ function Get-ManagedAccounts {
             $uri += "&accountname=${accountName}"
         }
         Write-Host "Requesting: $uri"
+
         try {
             $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -WebSession $session
-            Write-Host "Response: $($response | ConvertTo-Json -Depth 5)"
+            if ($response -and $response.accounts -and $response.accounts.Count -gt 0) {
+                $allAccounts += $response.accounts
+                $offset += $limit
+            } else {
+                break
+            }
         } catch {
             Write-Host "Failed to retrieve managed accounts: $($_.Exception.Message)"
             throw
         }
 
-        if ($response.accounts.Count -eq 0) {
-            break
-        }
-
-        $allAccounts += $response.accounts
-        $offset += $limit
-
+        # Stop the loop if fewer accounts are returned than the limit
         if ($response.accounts.Count -lt $limit) {
             break
         }
